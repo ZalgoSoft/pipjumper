@@ -34,6 +34,10 @@ PiP Jumper is a lightweight, resource-efficient Windows utility that automatical
 4. The window is instantly repositioned to a random location within the work area
 5. A cooldown timer prevents jumping back and forth
 
+## Demo
+
+![Demo](demo.svg)
+
 ## Installation
 
 ### Pre-built Binaries
