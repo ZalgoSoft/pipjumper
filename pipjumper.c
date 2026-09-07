@@ -14,8 +14,10 @@
 
 #define HOTKEY_TOGGLE       1
 #define HOTKEY_JUMP         2
+#define HOTKEY_TRANSPARENCY 3
 
 #define TIMER_SCAN          1
+#define TIMER_TRANSPARENCY  2
 #define WM_TRAYICON         (WM_APP + 1)
 
 #define MAX_PIP_WINDOWS     64
@@ -29,11 +31,11 @@
 #define MENU_COOLDOWN_UP    103
 #define MENU_COOLDOWN_DOWN  104
 
-// В самом начале файла, после #include (если они есть)
+
 
 #if defined(_WIN32) && !defined(_WIN64)
     #pragma message(">>> 32-bit build: custom memset/memcpy included")
-    // Этот код компилируется только для 32-битной Windows
+
     void* memset(void* dest, int ch, size_t count) {
         unsigned char* p = (unsigned char*)dest;
         while (count--) {
@@ -67,6 +69,13 @@ static HHOOK g_mouseHook = NULL;
 static BOOL  g_enabled = TRUE;
 static BOOL  g_dragging = FALSE;
 static BOOL  g_insidePip = FALSE;
+static BOOL  g_transparencyActive = TRUE;
+
+/* Per-PiP transparency state.  Only windows modified by us are restored. */
+static BOOL  g_transModified[MAX_PIP_WINDOWS];
+static LONG_PTR g_transOldExStyle[MAX_PIP_WINDOWS];
+static BYTE g_transOldAlpha[MAX_PIP_WINDOWS];
+static DWORD g_transOldFlags[MAX_PIP_WINDOWS];
 
 static DWORD g_cooldown = COOLDOWN_MS;
 
@@ -253,6 +262,14 @@ static BOOL IsPipWindow(HWND hwnd)
     if (!(ex & WS_EX_TOPMOST))
         return FALSE;
 
+   ex = GetWindowLongPtrW(hwnd, GWL_STYLE);
+
+    if (ex & WS_MAXIMIZEBOX)
+        return FALSE;
+    if (ex & WS_MINIMIZEBOX)
+        return FALSE;
+
+
     cls[0] = 0;
     title[0] = 0;
 
@@ -310,10 +327,15 @@ static BOOL CALLBACK EnumProc(HWND hwnd, LPARAM lp)
             return TRUE;
     }
 
-    g_pip[g_pipCount] = hwnd;
-    g_lastJump[g_pipCount] = 0;
-    ++g_pipCount;
+g_pip[g_pipCount] = hwnd;
+g_lastJump[g_pipCount] = 0;
 
+g_transModified[g_pipCount] = FALSE;
+g_transOldExStyle[g_pipCount] = 0;
+g_transOldAlpha[g_pipCount] = 255;
+g_transOldFlags[g_pipCount] = 0;
+
+++g_pipCount;
     return TRUE;
 }
 
@@ -324,6 +346,10 @@ static void UpdatePipList(void)
 {
     HWND old[MAX_PIP_WINDOWS];
     DWORD oldTime[MAX_PIP_WINDOWS];
+    BOOL oldModified[MAX_PIP_WINDOWS];
+    LONG_PTR oldExStyle[MAX_PIP_WINDOWS];
+    BYTE oldAlpha[MAX_PIP_WINDOWS];
+    DWORD oldFlags[MAX_PIP_WINDOWS];
     int oldCount = g_pipCount;
 
     /*
@@ -341,6 +367,26 @@ static void UpdatePipList(void)
             g_lastJump,
             (SIZE_T)oldCount * sizeof(oldTime[0])
         );
+        MemCopy(
+            oldModified,
+            g_transModified,
+            (SIZE_T)oldCount * sizeof(oldModified[0])
+        );
+        MemCopy(
+            oldExStyle,
+            g_transOldExStyle,
+            (SIZE_T)oldCount * sizeof(oldExStyle[0])
+        );
+        MemCopy(
+            oldAlpha,
+            g_transOldAlpha,
+            (SIZE_T)oldCount * sizeof(oldAlpha[0])
+        );
+        MemCopy(
+            oldFlags,
+            g_transOldFlags,
+            (SIZE_T)oldCount * sizeof(oldFlags[0])
+        );
     }
 
     g_pipCount = 0;
@@ -354,6 +400,10 @@ static void UpdatePipList(void)
         for (int j = 0; j < oldCount; ++j) {
             if (g_pip[i] == old[j]) {
                 g_lastJump[i] = oldTime[j];
+                g_transModified[i] = oldModified[j];
+                g_transOldExStyle[i] = oldExStyle[j];
+                g_transOldAlpha[i] = oldAlpha[j];
+                g_transOldFlags[i] = oldFlags[j];
                 break;
             }
         }
@@ -457,6 +507,124 @@ static DWORD NextRandom(DWORD max)
     return max ? s % max : 0;
 }
 
+
+/* ------------------------------------------------------------------------- */
+/*
+ * Temporary mouse-wheel transparency.
+ *
+ * Ctrl+Shift+X enables this mode for 5 seconds.  While active:
+ *   wheel up   -> more opaque
+ *   wheel down -> more transparent
+ *
+ * The original layered-window state is restored when the 5 seconds expire.
+ */
+static void RestoreTransparency(void)
+{
+    int i;
+
+    for (i = 0; i < g_pipCount; ++i) {
+        HWND hwnd = g_pip[i];
+
+        if (!g_transModified[i] || !IsWindow(hwnd))
+            continue;
+
+        if (g_transOldExStyle[i] & WS_EX_LAYERED) {
+            if (g_transOldFlags[i] & LWA_ALPHA)
+                SetLayeredWindowAttributes(
+                    hwnd, 0, g_transOldAlpha[i], LWA_ALPHA
+                );
+            SetWindowLongPtrW(
+                hwnd, GWL_EXSTYLE,
+                g_transOldExStyle[i]
+            );
+        } else {
+            SetWindowLongPtrW(
+                hwnd, GWL_EXSTYLE,
+                g_transOldExStyle[i]
+            );
+        }
+
+        g_transModified[i] = FALSE;
+    }
+
+    g_transparencyActive = FALSE;
+}
+
+static void EnableTransparency(void)
+{
+    g_transparencyActive = TRUE;
+//    SetTimer(g_main, TIMER_TRANSPARENCY, 5000, NULL);
+}
+
+static void ChangeTransparency(HWND hwnd, int wheelDelta)
+{
+    int idx;
+    LONG_PTR ex;
+    BYTE alpha;
+    BYTE oldAlpha = 255;
+
+    if (!g_transparencyActive || !IsWindow(hwnd))
+        return;
+
+    idx = FindPip(hwnd);
+    if (idx < 0)
+        return;
+
+    ex = GetWindowLongPtrW(hwnd, GWL_EXSTYLE);
+
+    if (!g_transModified[idx]) {
+        g_transOldExStyle[idx] = ex;
+        g_transOldAlpha[idx] = 255;
+        g_transOldFlags[idx] = 0;
+
+        if (ex & WS_EX_LAYERED) {
+            BYTE queriedAlpha;
+            DWORD flags;
+
+            queriedAlpha = 255;
+            flags = 0;
+
+            if (GetLayeredWindowAttributes(
+                    hwnd, NULL, &queriedAlpha, &flags)) {
+                g_transOldFlags[idx] = flags;
+                if (flags & LWA_ALPHA)
+                    g_transOldAlpha[idx] = queriedAlpha;
+            }
+        }
+
+        g_transModified[idx] = TRUE;
+        oldAlpha = g_transOldAlpha[idx];
+
+        if (!(ex & WS_EX_LAYERED)) {
+            SetWindowLongPtrW(
+                hwnd,
+                GWL_EXSTYLE,
+                ex | WS_EX_LAYERED
+            );
+        }
+    } else {
+        oldAlpha = 255;
+        if (!GetLayeredWindowAttributes(
+                hwnd, NULL, &oldAlpha, NULL))
+            oldAlpha = 255;
+    }
+
+    alpha = oldAlpha;
+
+    if (wheelDelta > 0) {
+        if (alpha < 239)
+            alpha = (BYTE)(alpha + 16);
+        else
+            alpha = 255;
+    } else if (wheelDelta < 0) {
+        if (alpha > 32)
+            alpha = (BYTE)(alpha - 16);
+        else
+            alpha = 16;
+    }
+
+    SetLayeredWindowAttributes(hwnd, 0, alpha, LWA_ALPHA);
+}
 
 /* ------------------------------------------------------------------------- */
 
@@ -581,16 +749,16 @@ static void ToggleEnabled(void)
 
 /* ------------------------------------------------------------------------- */
 
-static void JumpAll(void)
-{
-    if (!g_enabled)
-        return;
-
-    UpdatePipList();
-
-    for (int i = 0; i < g_pipCount; ++i)
-        JumpWindow(g_pip[i]);
-}
+//static void JumpAll(void)
+//{
+//    if (!g_enabled)
+//        return;
+//
+//    UpdatePipList();
+//
+//    for (int i = 0; i < g_pipCount; ++i)
+//        JumpWindow(g_pip[i]);
+//}
 
 
 /* ------------------------------------------------------------------------- */
@@ -613,12 +781,12 @@ static void ShowTrayMenu(void)
         L"Enabled"
     );
 
-    AppendMenuW(
-        menu,
-        MF_STRING,
-        MENU_JUMP,
-        L"Jump all PiP windows"
-    );
+//    AppendMenuW(
+//        menu,
+//        MF_STRING,
+//        MENU_JUMP,
+//        L"Jump all PiP windows"
+//    );
 
     AppendMenuW(
         menu,
@@ -724,6 +892,14 @@ static LRESULT CALLBACK MouseProc(
         else if (msg == WM_LBUTTONUP) {
             g_dragging = FALSE;
         }
+        else if (msg == WM_MOUSEWHEEL && g_transparencyActive) {
+            HWND pip = PipFromPoint(m->pt);
+            if (pip)
+                ChangeTransparency(
+                    pip,
+                    (short)HIWORD(m->mouseData)
+                );
+        }
         else if (msg == WM_MOUSEMOVE && !g_dragging) {
             static POINT last = { -1, -1 };
 
@@ -744,8 +920,14 @@ static LRESULT CALLBACK MouseProc(
                  * This prevents repeated jumping while the cursor
                  * remains inside the same PiP window.
                  */
-                if (inside && !g_insidePip)
-                    JumpWindow(pip);
+                if (inside && !g_insidePip) {
+                    /*
+                     * Holding Alt means "interact with the PiP window":
+                     * do not jump it while entering it.
+                     */
+                    if (!(GetAsyncKeyState(VK_MENU) & 0x8000))
+                        JumpWindow(pip);
+                }
 
                 g_insidePip = inside;
             }
@@ -814,12 +996,19 @@ static LRESULT CALLBACK WndProc(
             'P'
         );
 
-        RegisterHotKey(
-            hwnd,
-            HOTKEY_JUMP,
-            MOD_CONTROL | MOD_SHIFT,
-            'J'
-        );
+//        RegisterHotKey(
+//            hwnd,
+//            HOTKEY_JUMP,
+//            MOD_CONTROL | MOD_SHIFT,
+//            'J'
+//        );
+
+//        RegisterHotKey(
+//            hwnd,
+//            HOTKEY_TRANSPARENCY,
+//            MOD_CONTROL | MOD_SHIFT,
+//            'X'
+//        );
 
         UpdatePipList();
 
@@ -838,6 +1027,10 @@ static LRESULT CALLBACK WndProc(
 
         if (wp == TIMER_SCAN && g_enabled)
             UpdatePipList();
+//        else if (wp == TIMER_TRANSPARENCY) {
+//            KillTimer(hwnd, TIMER_TRANSPARENCY);
+//            RestoreTransparency();
+//        }
 
         return 0;
 
@@ -846,8 +1039,10 @@ static LRESULT CALLBACK WndProc(
 
         if (wp == HOTKEY_TOGGLE)
             ToggleEnabled();
-        else if (wp == HOTKEY_JUMP)
-            JumpAll();
+//        else if (wp == HOTKEY_JUMP)
+//            JumpAll();
+//        else if (wp == HOTKEY_TRANSPARENCY)
+//            EnableTransparency();
 
         return 0;
 
@@ -870,9 +1065,9 @@ static LRESULT CALLBACK WndProc(
             ToggleEnabled();
             break;
 
-        case MENU_JUMP:
-            JumpAll();
-            break;
+//        case MENU_JUMP:
+//            JumpAll();
+//            break;
 
         case MENU_COOLDOWN_UP:
 
@@ -905,16 +1100,27 @@ static LRESULT CALLBACK WndProc(
             hwnd,
             TIMER_SCAN
         );
+//        KillTimer(
+//            hwnd,
+//            TIMER_TRANSPARENCY
+//        );
+
+        if (g_transparencyActive)
+            RestoreTransparency();
 
         UnregisterHotKey(
             hwnd,
             HOTKEY_TOGGLE
         );
 
-        UnregisterHotKey(
-            hwnd,
-            HOTKEY_JUMP
-        );
+//        UnregisterHotKey(
+//            hwnd,
+//            HOTKEY_JUMP
+//        );
+//        UnregisterHotKey(
+//            hwnd,
+//            HOTKEY_TRANSPARENCY
+//        );
 
         MemZero(&n, sizeof(n));
 
