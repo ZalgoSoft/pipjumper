@@ -38,6 +38,7 @@
 #define TOOLTIP_HELP L"| Ctrl+Shift+P\nhold Alt: temporarily disable jumping\nmouse scroll: change PIP transparency"
 
 #define VIRTUAL_OFFSET      100
+static HANDLE g_mutex = NULL;
 
 #if defined(_WIN32) && !defined(_WIN64)
 
@@ -983,6 +984,11 @@ void WINAPI EntryPoint(void)
     HWND hwnd;
     MSG msg;
     int result;
+
+    g_mutex = CreateMutexW(NULL, TRUE, L"PiPJumper_SingleInstance");
+    if (GetLastError() == ERROR_ALREADY_EXISTS) {
+        ExitProcess(0);
+    }
 
     SetDpiAwareness();
 
