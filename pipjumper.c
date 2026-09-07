@@ -8,24 +8,36 @@
 #pragma comment(lib, "user32.lib")
 #pragma comment(lib, "shell32.lib")
 
-#define APP_CLASS L"PiPJumperClass"
+#define APP_CLASS           L"PiPJumperClass"
+#define TRAY_ID             1
 
-#define TRAY_ID 1
-#define HOTKEY_TOGGLE 1
-#define WM_TRAYICON (WM_APP + 1)
+#define HOTKEY_MODE         1
 
-#define MENU_EXIT 100
-#define MENU_TOGGLE 101
-#define MENU_COOLDOWN_UP 103
-#define MENU_COOLDOWN_DOWN 104
-#define MENU_CLICKTHROUGH 105
+#define TIMER_SCAN          1
+#define WM_TRAYICON         (WM_APP + 1)
 
-#define COOLDOWN_DEFAULT 200
-#define EDGE_PADDING 24
+#define SCAN_INTERVAL_MS    500
+#define COOLDOWN_MS         200
+#define EDGE_PADDING        24
+#define CLICK_ALPHA         16
 
-#define ALPHA_MIN 16
-#define ALPHA_MAX 255
-#define ALPHA_STEP 16
+#define MENU_ENABLED        101
+#define MENU_CLICKTHROUGH  102
+#define MENU_DISABLED       103
+#define MENU_EXIT           104
+
+#define MODE_ENABLED        0
+#define MODE_CLICKTHROUGH  1
+#define MODE_DISABLED       2
+
+#define MENU_ABOUT 105
+
+#define APP_NAME L"PiPjumper"
+#define APP_VERSION L"1.1"
+#define APP_BUILD_DATE L"07.09.2026"
+#define TOOLTIP_HELP L"| Ctrl+Shift+P\nhold Alt: temporarily disable jumping\nmouse scroll: change PIP transparency"
+
+#define VIRTUAL_OFFSET      100
 
 #if defined(_WIN32) && !defined(_WIN64)
 
@@ -52,24 +64,21 @@ void* memcpy(void* dest, const void* src, size_t count)
 
 #endif
 
-static HWND g_main;
-static HHOOK g_mouseHook;
+static HWND g_main = NULL;
+static HHOOK g_mouseHook = NULL;
 
-static BOOL g_enabled = TRUE;
+static int g_mode = MODE_ENABLED;
 static BOOL g_dragging = FALSE;
-static BOOL g_clickThrough = FALSE;
-static BOOL g_forwarding = FALSE;
+static BOOL g_insidePip = FALSE;
 
-static HWND g_hoverPip = NULL;
-static HWND g_clickPip = NULL;
-
+static HWND g_lastJumpPip = NULL;
 static DWORD g_lastJump = 0;
-static DWORD g_cooldown = COOLDOWN_DEFAULT;
 
+static HWND g_clickPip = NULL;
+static RECT g_clickRect;
 static LONG_PTR g_clickOldExStyle = 0;
-static BYTE g_clickOldAlpha = ALPHA_MAX;
+static BYTE g_clickOldAlpha = 255;
 static BOOL g_clickSaved = FALSE;
-
 
 static void MemZero(void* ptr, SIZE_T size)
 {
@@ -78,7 +87,6 @@ static void MemZero(void* ptr, SIZE_T size)
     while (size--)
         *p++ = 0;
 }
-
 
 static BOOL StrContains(const WCHAR* str, const WCHAR* sub)
 {
@@ -115,7 +123,6 @@ static BOOL StrContains(const WCHAR* str, const WCHAR* sub)
     return FALSE;
 }
 
-
 static void LowerCopy(WCHAR* dst, const WCHAR* src, int capacity)
 {
     int i = 0;
@@ -135,11 +142,10 @@ static void LowerCopy(WCHAR* dst, const WCHAR* src, int capacity)
     dst[i] = 0;
 }
 
-
 static void SetDpiAwareness(void)
 {
-    typedef BOOL(WINAPI* PFN_SET_DPI_CONTEXT)(HANDLE);
-    typedef BOOL(WINAPI* PFN_SET_DPI_AWARE)(void);
+    typedef BOOL (WINAPI *PFN_SET_DPI_CONTEXT)(HANDLE);
+    typedef BOOL (WINAPI *PFN_SET_DPI_AWARE)(void);
 
     HMODULE user32;
     PFN_SET_DPI_CONTEXT setContext;
@@ -150,40 +156,47 @@ static void SetDpiAwareness(void)
     if (!user32)
         return;
 
-    setContext = (PFN_SET_DPI_CONTEXT)GetProcAddress(
-        user32,
-        "SetProcessDpiAwarenessContext"
-    );
+    setContext = (PFN_SET_DPI_CONTEXT)
+        GetProcAddress(user32, "SetProcessDpiAwarenessContext");
 
     if (setContext) {
         if (setContext((HANDLE)-4))
             return;
     }
 
-    setAware = (PFN_SET_DPI_AWARE)GetProcAddress(
-        user32,
-        "SetProcessDPIAware"
-    );
+    setAware = (PFN_SET_DPI_AWARE)
+        GetProcAddress(user32, "SetProcessDPIAware");
 
     if (setAware)
         setAware();
 }
 
-
 static HICON TrayIcon(void)
 {
-    return LoadIconW(
-        NULL,
-        g_enabled ? IDI_INFORMATION : IDI_WARNING
-    );
+    if (g_mode == MODE_ENABLED)
+        return LoadIconW(NULL, IDI_INFORMATION);
+
+    if (g_mode == MODE_CLICKTHROUGH)
+        return LoadIconW(NULL, IDI_QUESTION);
+
+    return LoadIconW(NULL, IDI_WARNING);
 }
 
+static const WCHAR* ModeText(void)
+{
+    if (g_mode == MODE_ENABLED)
+        return L"ON";
+
+    if (g_mode == MODE_CLICKTHROUGH)
+        return L"CLICK THROUGH";
+
+    return L"OFF";
+}
 
 static BOOL IsPipWindow(HWND hwnd)
 {
     LONG_PTR ex;
     LONG_PTR style;
-
     WCHAR cls[96];
     WCHAR title[256];
     WCHAR lower[256];
@@ -194,20 +207,17 @@ static BOOL IsPipWindow(HWND hwnd)
         !IsWindowVisible(hwnd))
         return FALSE;
 
-    ex = GetWindowLongPtrW(
-        hwnd,
-        GWL_EXSTYLE
-    );
+    ex = GetWindowLongPtrW(hwnd, GWL_EXSTYLE);
 
     if (!(ex & WS_EX_TOPMOST))
         return FALSE;
 
-    style = GetWindowLongPtrW(
-        hwnd,
-        GWL_STYLE
-    );
+    style = GetWindowLongPtrW(hwnd, GWL_STYLE);
 
-    if (style & (WS_MAXIMIZEBOX | WS_MINIMIZEBOX))
+    if (style & WS_MAXIMIZEBOX)
+        return FALSE;
+
+    if (style & WS_MINIMIZEBOX)
         return FALSE;
 
     cls[0] = 0;
@@ -219,72 +229,69 @@ static BOOL IsPipWindow(HWND hwnd)
         (int)(sizeof(cls) / sizeof(cls[0]))
     );
 
-    if (StrContains(cls, L"MozillaDialogClass") ||
-        StrContains(cls, L"MozillaCompositorWindowClass") ||
-        StrContains(cls, L"Chrome_WidgetWin"))
-        return TRUE;
-
     GetWindowTextW(
         hwnd,
         title,
         (int)(sizeof(title) / sizeof(title[0]))
     );
 
-    if (!title[0])
-        return FALSE;
-
-    LowerCopy(
-        lower,
-        title,
-        (int)(sizeof(lower) / sizeof(lower[0]))
-    );
-
-    if (StrContains(lower, L"picture-in-picture") ||
-        StrContains(lower, L"picture in picture"))
+    if (StrContains(cls, L"MozillaDialogClass") ||
+        StrContains(cls, L"MozillaCompositorWindowClass") ||
+        StrContains(cls, L"Chrome_WidgetWin"))
         return TRUE;
+
+    if (title[0]) {
+        LowerCopy(lower, title, 256);
+
+        if (StrContains(lower, L"picture-in-picture") ||
+            StrContains(lower, L"picture in picture"))
+            return TRUE;
+    }
 
     return FALSE;
 }
 
+static BOOL PointInWindow(HWND hwnd, POINT pt)
+{
+    RECT r;
+
+    if (!GetWindowRect(hwnd, &r))
+        return FALSE;
+
+    return PtInRect(&r, pt);
+}
 
 static HWND PipFromPoint(POINT pt)
 {
-    HWND hwnd;
+    HWND under;
     HWND root;
 
-    hwnd = WindowFromPoint(pt);
+    under = WindowFromPoint(pt);
 
-    if (!hwnd)
+    if (!under)
         return NULL;
 
-    if (IsPipWindow(hwnd))
-        return hwnd;
+    root = GetAncestor(under, GA_ROOT);
 
-    root = GetAncestor(
-        hwnd,
-        GA_ROOT
-    );
-
-    if (root && IsPipWindow(root))
+    if (IsPipWindow(root))
         return root;
 
     return NULL;
 }
 
-
-static void GetWorkArea(HWND hwnd, RECT* out)
+static void GetWindowWorkArea(HWND hwnd, RECT* out)
 {
-    HMONITOR monitor;
+    HMONITOR mon;
     MONITORINFO mi;
 
-    monitor = MonitorFromWindow(
+    mon = MonitorFromWindow(
         hwnd,
         MONITOR_DEFAULTTONEAREST
     );
 
     mi.cbSize = sizeof(mi);
 
-    if (GetMonitorInfoW(monitor, &mi)) {
+    if (GetMonitorInfoW(mon, &mi)) {
         *out = mi.rcWork;
         return;
     }
@@ -297,58 +304,29 @@ static void GetWorkArea(HWND hwnd, RECT* out)
     );
 }
 
-
 static DWORD NextRandom(DWORD max)
 {
-    static DWORD state = 0;
+    static DWORD s = 0;
 
-    if (!state)
-        state = GetTickCount() ^
-                (DWORD)(ULONG_PTR)&state;
+    if (!s)
+        s = GetTickCount() ^ (DWORD)(ULONG_PTR)&s;
 
-    state ^= state << 13;
-    state ^= state >> 17;
-    state ^= state << 5;
+    s ^= s << 13;
+    s ^= s >> 17;
+    s ^= s << 5;
 
-    if (max)
-        return state % max;
-
-    return 0;
+    return max ? s % max : 0;
 }
 
-
-static BOOL GetAlpha(HWND hwnd, BYTE* alpha)
-{
-    BYTE value = ALPHA_MAX;
-    DWORD flags = 0;
-
-    if (!GetLayeredWindowAttributes(
-            hwnd,
-            NULL,
-            &value,
-            &flags))
-        return FALSE;
-
-    if (!(flags & LWA_ALPHA))
-        value = ALPHA_MAX;
-
-    *alpha = value;
-
-    return TRUE;
-}
-
-
-static void SetAlpha(HWND hwnd, BYTE alpha)
+static void ChangeTransparency(HWND hwnd, int wheelDelta)
 {
     LONG_PTR ex;
+    BYTE alpha;
 
-    if (!IsWindow(hwnd))
+    if (g_mode != MODE_ENABLED || !IsPipWindow(hwnd))
         return;
 
-    ex = GetWindowLongPtrW(
-        hwnd,
-        GWL_EXSTYLE
-    );
+    ex = GetWindowLongPtrW(hwnd, GWL_EXSTYLE);
 
     if (!(ex & WS_EX_LAYERED)) {
         SetWindowLongPtrW(
@@ -357,19 +335,28 @@ static void SetAlpha(HWND hwnd, BYTE alpha)
             ex | WS_EX_LAYERED
         );
 
-        SetWindowPos(
-            hwnd,
-            NULL,
-            0,
-            0,
-            0,
-            0,
-            SWP_NOMOVE |
-            SWP_NOSIZE |
-            SWP_NOZORDER |
-            SWP_NOACTIVATE |
-            SWP_FRAMECHANGED
-        );
+        alpha = 255;
+    } else {
+        alpha = 255;
+
+        if (!GetLayeredWindowAttributes(
+                hwnd,
+                NULL,
+                &alpha,
+                NULL))
+            alpha = 255;
+    }
+
+    if (wheelDelta > 0) {
+        if (alpha < 239)
+            alpha = (BYTE)(alpha + 16);
+        else
+            alpha = 255;
+    } else if (wheelDelta < 0) {
+        if (alpha > 32)
+            alpha = (BYTE)(alpha - 16);
+        else
+            alpha = 16;
     }
 
     SetLayeredWindowAttributes(
@@ -380,168 +367,59 @@ static void SetAlpha(HWND hwnd, BYTE alpha)
     );
 }
 
-
-static void ChangeTransparency(HWND hwnd, int wheelDelta)
-{
-    BYTE alpha;
-
-    if (!IsPipWindow(hwnd))
-        return;
-
-    if (!GetAlpha(hwnd, &alpha))
-        alpha = ALPHA_MAX;
-
-    if (wheelDelta > 0) {
-        if (alpha >= ALPHA_MAX - ALPHA_STEP)
-            alpha = ALPHA_MAX;
-        else
-            alpha = (BYTE)(alpha + ALPHA_STEP);
-    }
-    else if (wheelDelta < 0) {
-        if (alpha <= ALPHA_MIN + ALPHA_STEP)
-            alpha = ALPHA_MIN;
-        else
-            alpha = (BYTE)(alpha - ALPHA_STEP);
-    }
-
-    SetAlpha(
-        hwnd,
-        alpha
-    );
-}
-
-
-static void RestoreClickThrough(void)
-{
-    HWND hwnd = g_clickPip;
-
-    if (!hwnd)
-        return;
-
-    if (IsWindow(hwnd) && g_clickSaved) {
-        if (g_clickOldExStyle & WS_EX_LAYERED) {
-            SetLayeredWindowAttributes(
-                hwnd,
-                0,
-                g_clickOldAlpha,
-                LWA_ALPHA
-            );
-        }
-
-        SetWindowLongPtrW(
-            hwnd,
-            GWL_EXSTYLE,
-            g_clickOldExStyle
-        );
-    }
-
-    g_clickPip = NULL;
-    g_clickSaved = FALSE;
-    g_clickOldExStyle = 0;
-    g_clickOldAlpha = ALPHA_MAX;
-}
-
-
-static void EnterClickThrough(HWND hwnd)
-{
-    LONG_PTR ex;
-    BYTE alpha = ALPHA_MAX;
-
-    if (!IsPipWindow(hwnd))
-        return;
-
-    if (g_clickPip == hwnd)
-        return;
-
-    RestoreClickThrough();
-
-    ex = GetWindowLongPtrW(
-        hwnd,
-        GWL_EXSTYLE
-    );
-
-    g_clickOldExStyle = ex;
-
-    if (ex & WS_EX_LAYERED)
-        GetAlpha(hwnd, &alpha);
-
-    g_clickOldAlpha = alpha;
-    g_clickSaved = TRUE;
-    g_clickPip = hwnd;
-
-    SetAlpha(
-        hwnd,
-        ALPHA_MIN
-    );
-}
-
-
 static void JumpWindow(HWND hwnd)
 {
     DWORD now;
-
     RECT area;
     RECT wr;
-
-    int width;
-    int height;
-
+    int w;
+    int h;
     int minX;
     int minY;
     int maxX;
     int maxY;
-
     int x;
     int y;
 
-    if (!g_enabled ||
-        g_clickThrough ||
+    if (g_mode != MODE_ENABLED ||
         !IsPipWindow(hwnd))
         return;
 
     now = GetTickCount();
 
-    if ((DWORD)(now - g_lastJump) < g_cooldown)
+    if (hwnd == g_lastJumpPip &&
+        (DWORD)(now - g_lastJump) < COOLDOWN_MS)
         return;
 
-    GetWorkArea(
-        hwnd,
-        &area
-    );
+    GetWindowWorkArea(hwnd, &area);
 
     if (!GetWindowRect(hwnd, &wr))
         return;
 
-    width = wr.right - wr.left;
-    height = wr.bottom - wr.top;
+    w = wr.right - wr.left;
+    h = wr.bottom - wr.top;
 
     minX = area.left + EDGE_PADDING;
     minY = area.top + EDGE_PADDING;
 
-    maxX = area.right - width - EDGE_PADDING;
-    maxY = area.bottom - height - EDGE_PADDING;
+    maxX = area.right - w - EDGE_PADDING;
+    maxY = area.bottom - h - EDGE_PADDING;
 
-    if (maxX <= minX) {
-        x = area.left +
-            ((area.right - area.left) - width) / 2;
-    }
-    else {
+    if (maxX <= minX)
+        x = area.left + ((area.right - area.left) - w) / 2;
+    else
         x = minX +
             (int)NextRandom(
                 (DWORD)(maxX - minX + 1)
             );
-    }
 
-    if (maxY <= minY) {
-        y = area.top +
-            ((area.bottom - area.top) - height) / 2;
-    }
-    else {
+    if (maxY <= minY)
+        y = area.top + ((area.bottom - area.top) - h) / 2;
+    else
         y = minY +
             (int)NextRandom(
                 (DWORD)(maxY - minY + 1)
             );
-    }
 
     SetWindowPos(
         hwnd,
@@ -556,18 +434,143 @@ static void JumpWindow(HWND hwnd)
         SWP_ASYNCWINDOWPOS
     );
 
+    g_lastJumpPip = hwnd;
     g_lastJump = now;
 }
 
+static void RestoreClickThrough(void)
+{
+    HWND hwnd;
+    LONG_PTR ex;
+
+    if (!g_clickSaved)
+        return;
+
+    hwnd = g_clickPip;
+
+    if (!hwnd || !IsWindow(hwnd)) {
+        g_clickPip = NULL;
+        g_clickSaved = FALSE;
+        return;
+    }
+
+    ex = g_clickOldExStyle;
+
+    SetWindowLongPtrW(
+        hwnd,
+        GWL_EXSTYLE,
+        ex
+    );
+
+    if (ex & WS_EX_LAYERED) {
+        SetLayeredWindowAttributes(
+            hwnd,
+            0,
+            g_clickOldAlpha,
+            LWA_ALPHA
+        );
+    }
+
+    SetWindowPos(
+        hwnd,
+        NULL,
+        g_clickRect.left,
+        g_clickRect.top,
+        0,
+        0,
+        SWP_NOSIZE |
+        SWP_NOZORDER |
+        SWP_NOACTIVATE |
+        SWP_ASYNCWINDOWPOS
+    );
+
+    g_clickPip = NULL;
+    g_clickSaved = FALSE;
+}
+
+static void EnterClickThrough(HWND hwnd)
+{
+    LONG_PTR ex;
+    BYTE alpha;
+    RECT vr;
+    int w;
+    int h;
+    int x;
+    int y;
+
+    if (g_mode != MODE_CLICKTHROUGH ||
+        !IsPipWindow(hwnd) ||
+        g_clickSaved)
+        return;
+
+    if (!GetWindowRect(hwnd, &g_clickRect))
+        return;
+
+    ex = GetWindowLongPtrW(hwnd, GWL_EXSTYLE);
+
+    alpha = 255;
+
+    if (ex & WS_EX_LAYERED) {
+        if (!GetLayeredWindowAttributes(
+                hwnd,
+                NULL,
+                &alpha,
+                NULL))
+            alpha = 255;
+    }
+
+    g_clickPip = hwnd;
+    g_clickOldExStyle = ex;
+    g_clickOldAlpha = alpha;
+    g_clickSaved = TRUE;
+
+    if (!(ex & WS_EX_LAYERED)) {
+        SetWindowLongPtrW(
+            hwnd,
+            GWL_EXSTYLE,
+            ex | WS_EX_LAYERED
+        );
+    }
+
+    SetLayeredWindowAttributes(
+        hwnd,
+        0,
+        CLICK_ALPHA,
+        LWA_ALPHA
+    );
+
+    vr.left = GetSystemMetrics(SM_XVIRTUALSCREEN);
+    vr.top = GetSystemMetrics(SM_YVIRTUALSCREEN);
+    vr.right = vr.left +
+        GetSystemMetrics(SM_CXVIRTUALSCREEN);
+    vr.bottom = vr.top +
+        GetSystemMetrics(SM_CYVIRTUALSCREEN);
+
+    w = g_clickRect.right - g_clickRect.left;
+    h = g_clickRect.bottom - g_clickRect.top;
+
+    x = vr.left - w - VIRTUAL_OFFSET;
+    y = vr.top - h - VIRTUAL_OFFSET;
+
+    SetWindowPos(
+        hwnd,
+        NULL,
+        x,
+        y,
+        0,
+        0,
+        SWP_NOSIZE |
+        SWP_NOZORDER |
+        SWP_NOACTIVATE |
+        SWP_ASYNCWINDOWPOS
+    );
+}
 
 static void UpdateTray(void)
 {
     NOTIFYICONDATAW n;
 
-    MemZero(
-        &n,
-        sizeof(n)
-    );
+    MemZero(&n, sizeof(n));
 
     n.cbSize = sizeof(n);
     n.hWnd = g_main;
@@ -577,8 +580,9 @@ static void UpdateTray(void)
 
     wsprintfW(
         n.szTip,
-        L"PiPjumper: %s | Ctrl+Shift+P",
-        g_enabled ? L"ON" : L"OFF"
+        L"PiPjumper: %s %s",
+        ModeText(),
+        TOOLTIP_HELP
     );
 
     Shell_NotifyIconW(
@@ -587,290 +591,73 @@ static void UpdateTray(void)
     );
 }
 
-
-static void ToggleEnabled(void)
+static void SetMode(int mode)
 {
-    g_enabled = !g_enabled;
-
-    g_hoverPip = NULL;
-
-    if (!g_enabled)
-        RestoreClickThrough();
-
-    UpdateTray();
-}
-
-
-static void ToggleClickThrough(void)
-{
-    //g_clickThrough = !g_clickThrough;
-
-    g_hoverPip = NULL;
-
-    if (!g_clickThrough)
-        RestoreClickThrough();
-
-    UpdateTray();
-}
-
-
-static HWND FindWindowUnderPip(POINT pt)
-{
-    HWND pip;
-    HWND target;
-    BOOL visible;
-
-    pip = g_clickPip;
-
-    if (!pip ||
-        !IsWindow(pip))
-        return NULL;
-
-    visible = IsWindowVisible(pip);
-
-    if (visible)
-        ShowWindow(
-            pip,
-            SW_HIDE
-        );
-
-    target = WindowFromPoint(pt);
-
-    if (visible) {
-        ShowWindow(
-            pip,
-            SW_SHOWNA
-        );
-
-        SetWindowPos(
-            pip,
-            HWND_TOPMOST,
-            0,
-            0,
-            0,
-            0,
-            SWP_NOMOVE |
-            SWP_NOSIZE |
-            SWP_NOACTIVATE |
-            SWP_SHOWWINDOW
-        );
-    }
-
-    if (!target ||
-        target == pip)
-        return NULL;
-
-    if (GetAncestor(target, GA_ROOT) == pip)
-        return NULL;
-
-    return target;
-}
-
-
-static void ForwardMouse(
-    WPARAM msg,
-    MSLLHOOKSTRUCT* mouse
-)
-{
-    INPUT input;
-
-    MemZero(
-        &input,
-        sizeof(input)
-    );
-
-    input.type = INPUT_MOUSE;
-
-    switch (msg) {
-    case WM_LBUTTONDOWN:
-        input.mi.dwFlags = MOUSEEVENTF_LEFTDOWN;
-        break;
-
-    case WM_LBUTTONUP:
-        input.mi.dwFlags = MOUSEEVENTF_LEFTUP;
-        break;
-
-    case WM_RBUTTONDOWN:
-        input.mi.dwFlags = MOUSEEVENTF_RIGHTDOWN;
-        break;
-
-    case WM_RBUTTONUP:
-        input.mi.dwFlags = MOUSEEVENTF_RIGHTUP;
-        break;
-
-    case WM_MBUTTONDOWN:
-        input.mi.dwFlags = MOUSEEVENTF_MIDDLEDOWN;
-        break;
-
-    case WM_MBUTTONUP:
-        input.mi.dwFlags = MOUSEEVENTF_MIDDLEUP;
-        break;
-
-    case WM_XBUTTONDOWN:
-        input.mi.dwFlags = MOUSEEVENTF_XDOWN;
-        input.mi.mouseData = HIWORD(mouse->mouseData);
-        break;
-
-    case WM_XBUTTONUP:
-        input.mi.dwFlags = MOUSEEVENTF_XUP;
-        input.mi.mouseData = HIWORD(mouse->mouseData);
-        break;
-
-    default:
-        return;
-    }
-
-    g_forwarding = TRUE;
-
-    SendInput(
-        1,
-        &input,
-        sizeof(input)
-    );
-
-    g_forwarding = FALSE;
-}
-
-
-static BOOL IsClickMessage(WPARAM msg)
-{
-    switch (msg) {
-    case WM_LBUTTONDOWN:
-    case WM_LBUTTONUP:
-    case WM_RBUTTONDOWN:
-    case WM_RBUTTONUP:
-    case WM_MBUTTONDOWN:
-    case WM_MBUTTONUP:
-    case WM_XBUTTONDOWN:
-    case WM_XBUTTONUP:
-        return TRUE;
-    }
-
-    return FALSE;
-}
-
-
-static LRESULT CALLBACK MouseProc(
-    int code,
-    WPARAM msg,
-    LPARAM lp
-)
-{
-    MSLLHOOKSTRUCT* mouse;
     POINT pt;
     HWND pip;
 
-    if (code < 0) {
-        return CallNextHookEx(
-            g_mouseHook,
-            code,
-            msg,
-            lp
-        );
-    }
+    if (mode == g_mode)
+        return;
 
-    mouse = (MSLLHOOKSTRUCT*)lp;
-    pt = mouse->pt;
+    if (g_mode == MODE_CLICKTHROUGH)
+        RestoreClickThrough();
 
-    if (g_forwarding) {
-        return CallNextHookEx(
-            g_mouseHook,
-            code,
-            msg,
-            lp
-        );
-    }
+    g_mode = mode;
+    g_insidePip = FALSE;
 
-    if (!g_enabled) {
-        return CallNextHookEx(
-            g_mouseHook,
-            code,
-            msg,
-            lp
-        );
-    }
+    UpdateTray();
 
-    if (msg == WM_LBUTTONDOWN) {
-        g_dragging = TRUE;
-    }
-    else if (msg == WM_LBUTTONUP) {
-        g_dragging = FALSE;
-    }
-
-    if (msg == WM_MOUSEWHEEL) {
+    if (g_mode == MODE_CLICKTHROUGH) {
+        GetCursorPos(&pt);
         pip = PipFromPoint(pt);
 
         if (pip) {
-            ChangeTransparency(
-                pip,
-                (short)HIWORD(mouse->mouseData)
-            );
+            EnterClickThrough(pip);
+            g_insidePip = TRUE;
         }
+    } else if (g_mode == MODE_ENABLED) {
+        GetCursorPos(&pt);
+
+        if (PipFromPoint(pt))
+            g_insidePip = TRUE;
     }
-
-    if (msg == WM_MOUSEMOVE && !g_dragging) {
-        pip = PipFromPoint(pt);
-
-        if (g_clickThrough) {
-            if (pip != g_hoverPip) {
-                if (pip) {
-                    EnterClickThrough(pip);
-                }
-                else {
-                    RestoreClickThrough();
-                }
-
-                g_hoverPip = pip;
-            }
-        }
-        else {
-            if (pip != g_hoverPip) {
-                g_hoverPip = pip;
-
-                if (pip &&
-                    !(GetAsyncKeyState(VK_MENU) & 0x8000)) {
-                    JumpWindow(pip);
-                }
-            }
-        }
-    }
-
-    if (g_clickThrough &&
-        g_clickPip &&
-        IsClickMessage(msg)) {
-
-        pip = PipFromPoint(pt);
-
-        if (pip == g_clickPip) {
-            HWND target;
-
-            target = FindWindowUnderPip(pt);
-
-            if (target) {
-                ForwardMouse(
-                    msg,
-                    mouse
-                );
-
-                return 1;
-            }
-        }
-    }
-
-    return CallNextHookEx(
-        g_mouseHook,
-        code,
-        msg,
-        lp
-    );
 }
 
+static void CycleMode(void)
+{
+    int mode;
+
+    mode = g_mode + 1;
+
+    if (mode > MODE_DISABLED)
+        mode = MODE_ENABLED;
+
+    SetMode(mode);
+}
+
+void ShowAbout(void)
+{
+    WCHAR text[256];
+
+    wsprintfW(
+        text,
+        L"PiPjumper\n\nTiny tool to allow Picture-in-Picture window to move with mouse and change it's transparency.\nVersion: %s\nBuild date: %s\n\nSupport:\nhttps://github.com/ZalgoSoft/pipjumper",
+        APP_VERSION,
+        APP_BUILD_DATE
+    );
+
+    MessageBoxW(
+        g_main,
+        text,
+        L"About PiPjumper",
+        MB_OK | MB_ICONINFORMATION
+    );
+}
 
 static void ShowTrayMenu(void)
 {
     HMENU menu;
     POINT pt;
-    WCHAR text[64];
 
     menu = CreatePopupMenu();
 
@@ -880,51 +667,25 @@ static void ShowTrayMenu(void)
     AppendMenuW(
         menu,
         MF_STRING |
-        (g_enabled ? MF_CHECKED : 0),
-        MENU_TOGGLE,
+        (g_mode == MODE_ENABLED ? MF_CHECKED : 0),
+        MENU_ENABLED,
         L"Enabled"
     );
 
     AppendMenuW(
         menu,
         MF_STRING |
-        (g_clickThrough ? MF_CHECKED : 0),
+        (g_mode == MODE_CLICKTHROUGH ? MF_CHECKED : 0),
         MENU_CLICKTHROUGH,
         L"Click through"
     );
 
     AppendMenuW(
         menu,
-        MF_SEPARATOR,
-        0,
-        NULL
-    );
-
-    AppendMenuW(
-        menu,
-        MF_STRING,
-        MENU_COOLDOWN_DOWN,
-        L"Cooldown - 100 ms"
-    );
-
-    AppendMenuW(
-        menu,
-        MF_STRING,
-        MENU_COOLDOWN_UP,
-        L"Cooldown + 100 ms"
-    );
-
-    wsprintfW(
-        text,
-        L"Cooldown: %lu ms",
-        g_cooldown
-    );
-
-    AppendMenuW(
-        menu,
-        MF_STRING | MF_DISABLED,
-        0,
-        text
+        MF_STRING |
+        (g_mode == MODE_DISABLED ? MF_CHECKED : 0),
+        MENU_DISABLED,
+        L"Disabled"
     );
 
     AppendMenuW(
@@ -933,6 +694,9 @@ static void ShowTrayMenu(void)
         0,
         NULL
     );
+
+AppendMenuW(menu, MF_STRING, MENU_ABOUT, L"About");
+AppendMenuW(menu, MF_SEPARATOR, 0, NULL);
 
     AppendMenuW(
         menu,
@@ -943,9 +707,7 @@ static void ShowTrayMenu(void)
 
     GetCursorPos(&pt);
 
-    SetForegroundWindow(
-        g_main
-    );
+    SetForegroundWindow(g_main);
 
     TrackPopupMenu(
         menu,
@@ -968,13 +730,103 @@ static void ShowTrayMenu(void)
     DestroyMenu(menu);
 }
 
+static void ProcessMouseMove(POINT pt)
+{
+    HWND pip;
+
+    if (g_mode == MODE_CLICKTHROUGH &&
+                !(GetAsyncKeyState(VK_MENU) & 0x8000)) {
+        if (g_clickSaved) {
+            if (PtInRect(&g_clickRect, pt)) {
+                g_insidePip = TRUE;
+                return;
+            }
+
+            RestoreClickThrough();
+            g_insidePip = FALSE;
+        }
+
+        pip = PipFromPoint(pt);
+
+        if (pip) {
+            EnterClickThrough(pip);
+            g_insidePip = TRUE;
+        }
+
+        return;
+    }
+
+    pip = PipFromPoint(pt);
+
+    if (pip) {
+        if (!g_insidePip) {
+            if (g_mode == MODE_ENABLED &&
+                !(GetAsyncKeyState(VK_MENU) & 0x8000))
+                JumpWindow(pip);
+
+            g_insidePip = TRUE;
+        }
+    } else {
+        g_insidePip = FALSE;
+    }
+}
+
+static LRESULT CALLBACK MouseProc(
+    int code,
+    WPARAM msg,
+    LPARAM lp)
+{
+    if (code >= 0) {
+        MSLLHOOKSTRUCT* m;
+
+        m = (MSLLHOOKSTRUCT*)lp;
+
+        if (msg == WM_LBUTTONDOWN) {
+            g_dragging = TRUE;
+        }
+        else if (msg == WM_LBUTTONUP) {
+            g_dragging = FALSE;
+        }
+        else if (msg == WM_MOUSEWHEEL) {
+            if (g_mode == MODE_ENABLED) {
+                HWND pip;
+
+                pip = PipFromPoint(m->pt);
+
+                if (pip) {
+                    ChangeTransparency(
+                        pip,
+                        (short)HIWORD(m->mouseData)
+                    );
+                }
+            }
+        }
+        else if (msg == WM_MOUSEMOVE &&
+                 !g_dragging) {
+            static POINT last = { -1, -1 };
+
+            if (m->pt.x != last.x ||
+                m->pt.y != last.y) {
+
+                last = m->pt;
+                ProcessMouseMove(m->pt);
+            }
+        }
+    }
+
+    return CallNextHookEx(
+        g_mouseHook,
+        code,
+        msg,
+        lp
+    );
+}
 
 static LRESULT CALLBACK WndProc(
     HWND hwnd,
     UINT msg,
     WPARAM wp,
-    LPARAM lp
-)
+    LPARAM lp)
 {
     switch (msg) {
 
@@ -984,10 +836,7 @@ static LRESULT CALLBACK WndProc(
 
         g_main = hwnd;
 
-        MemZero(
-            &n,
-            sizeof(n)
-        );
+        MemZero(&n, sizeof(n));
 
         n.cbSize = sizeof(n);
         n.hWnd = hwnd;
@@ -997,14 +846,13 @@ static LRESULT CALLBACK WndProc(
             NIF_MESSAGE |
             NIF_TIP;
 
-        n.uCallbackMessage =
-            WM_TRAYICON;
-
+        n.uCallbackMessage = WM_TRAYICON;
         n.hIcon = TrayIcon();
 
         wsprintfW(
             n.szTip,
-            L"PiPjumper: ON | Ctrl+Shift+P"
+            L"PiPjumper: ON %s",
+	    TOOLTIP_HELP
         );
 
         Shell_NotifyIconW(
@@ -1014,57 +862,62 @@ static LRESULT CALLBACK WndProc(
 
         RegisterHotKey(
             hwnd,
-            HOTKEY_TOGGLE,
+            HOTKEY_MODE,
             MOD_CONTROL | MOD_SHIFT,
             'P'
+        );
+
+        SetTimer(
+            hwnd,
+            TIMER_SCAN,
+            SCAN_INTERVAL_MS,
+            NULL
         );
 
         return 0;
     }
 
-
-    case WM_HOTKEY:
-
-        if (wp == HOTKEY_TOGGLE)
-            ToggleEnabled();
+    case WM_TIMER:
+        if (wp == TIMER_SCAN) {
+            if (g_clickSaved &&
+                (!IsWindow(g_clickPip) ||
+                 !IsWindowVisible(g_clickPip)))
+                RestoreClickThrough();
+        }
 
         return 0;
 
+    case WM_HOTKEY:
+        if (wp == HOTKEY_MODE)
+            CycleMode();
+
+        return 0;
 
     case WM_TRAYICON:
-
         if (lp == WM_LBUTTONDBLCLK)
-            ToggleEnabled();
+            CycleMode();
         else if (lp == WM_RBUTTONUP)
             ShowTrayMenu();
 
         return 0;
 
-
     case WM_COMMAND:
-
         switch (LOWORD(wp)) {
 
-        case MENU_TOGGLE:
-            ToggleEnabled();
+        case MENU_ENABLED:
+            SetMode(MODE_ENABLED);
             break;
 
         case MENU_CLICKTHROUGH:
-            ToggleClickThrough();
+            SetMode(MODE_CLICKTHROUGH);
             break;
 
-        case MENU_COOLDOWN_UP:
-
-            if (g_cooldown < 10000)
-                g_cooldown += 100;
-
+        case MENU_DISABLED:
+            SetMode(MODE_DISABLED);
             break;
 
-        case MENU_COOLDOWN_DOWN:
-
-            if (g_cooldown > 100)
-                g_cooldown -= 100;
-
+	case MENU_ABOUT:
+	    ShowAbout();
             break;
 
         case MENU_EXIT:
@@ -1074,22 +927,23 @@ static LRESULT CALLBACK WndProc(
 
         return 0;
 
-
     case WM_DESTROY:
     {
         NOTIFYICONDATAW n;
+
+        KillTimer(
+            hwnd,
+            TIMER_SCAN
+        );
 
         RestoreClickThrough();
 
         UnregisterHotKey(
             hwnd,
-            HOTKEY_TOGGLE
+            HOTKEY_MODE
         );
 
-        MemZero(
-            &n,
-            sizeof(n)
-        );
+        MemZero(&n, sizeof(n));
 
         n.cbSize = sizeof(n);
         n.hWnd = hwnd;
@@ -1122,7 +976,6 @@ static LRESULT CALLBACK WndProc(
     );
 }
 
-
 void WINAPI EntryPoint(void)
 {
     HINSTANCE inst;
@@ -1135,10 +988,7 @@ void WINAPI EntryPoint(void)
 
     inst = GetModuleHandleW(NULL);
 
-    MemZero(
-        &wc,
-        sizeof(wc)
-    );
+    MemZero(&wc, sizeof(wc));
 
     wc.lpfnWndProc = WndProc;
     wc.hInstance = inst;
@@ -1197,8 +1047,6 @@ void WINAPI EntryPoint(void)
     }
 
     ExitProcess(
-        result < 0
-            ? 3
-            : (UINT)msg.wParam
+        result < 0 ? 3 : (UINT)msg.wParam
     );
 }
