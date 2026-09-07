@@ -22,6 +22,7 @@ PiPjumper is a lightweight utility that automatically moves Picture-in-Picture w
 - **Statically linked**: No runtime dependencies, works out-of-the-box on any Windows system
 - **Low memory footprint**: ~200KB executable size, minimal resource usage
 - **Scan interval**: Optimized 500ms scanning with 200ms cooldown to prevent excessive jumps
+- **Single instance**: Simple check for running instance
 
 ## Modes
 
