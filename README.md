@@ -31,6 +31,10 @@ PiPjumper is a lightweight utility that automatically moves Picture-in-Picture w
 | **Click-through** | ❓ | PIP window becomes semi-transparent (16 alpha) and moves off-screen, allowing clicks to pass through to underlying windows |
 | **Disabled** | ⚠️ | All functionality temporarily suspended |
 
+## Demo
+
+![Demo](demo.svg)
+
 ## System Requirements
 
 | Windows Version | Support Level | Notes |
@@ -160,10 +164,6 @@ PiPjumper detects Picture-in-Picture windows by analyzing:
 - **Scan Interval**: 500ms (reduces unnecessary processing)
 - **Jump Cooldown**: 200ms (prevents flickering)
 - **Startup Time**: Instant (< 50ms)
-
-## Demo
-
-![Demo](demo.svg)
 
 ## Building Requirements
 
